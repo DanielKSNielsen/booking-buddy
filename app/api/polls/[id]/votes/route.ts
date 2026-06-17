@@ -23,10 +23,9 @@ export async function POST(request: Request, context: RouteContext) {
     }
 
     return NextResponse.json(computeResults(poll));
-  } catch {
-    return NextResponse.json(
-      { error: "Failed to submit votes" },
-      { status: 500 }
-    );
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to submit votes";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

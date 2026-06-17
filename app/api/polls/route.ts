@@ -22,10 +22,9 @@ export async function POST(request: Request) {
 
     const poll = await createPoll(body);
     return NextResponse.json(poll, { status: 201 });
-  } catch {
-    return NextResponse.json(
-      { error: "Failed to create poll" },
-      { status: 500 }
-    );
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to create poll";
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

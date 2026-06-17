@@ -1,91 +1,138 @@
-import { promises as fs } from "fs";
-import path from "path";
+import { getSupabaseAdmin } from "@/lib/supabase/server";
 import type {
   CreatePollInput,
   Poll,
   PollResults,
   SlotResult,
   SubmitVotesInput,
-  Vote,
 } from "@/lib/types";
-
-/**
- * Mock database layer — swap this module for Supabase/Firebase later.
- * All poll persistence goes through these functions.
- */
-
-const DATA_DIR = path.join(process.cwd(), "data");
-const POLLS_FILE = path.join(DATA_DIR, "polls.json");
-
-async function ensureDataFile(): Promise<Poll[]> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  try {
-    const raw = await fs.readFile(POLLS_FILE, "utf-8");
-    return JSON.parse(raw) as Poll[];
-  } catch {
-    return [];
-  }
-}
-
-async function writePolls(polls: Poll[]): Promise<void> {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(POLLS_FILE, JSON.stringify(polls, null, 2), "utf-8");
-}
 
 function generateId(): string {
   return Math.random().toString(36).slice(2, 10);
 }
 
-export async function createPoll(input: CreatePollInput): Promise<Poll> {
-  const polls = await ensureDataFile();
+async function fetchPollById(id: string): Promise<Poll | null> {
+  const supabase = getSupabaseAdmin();
 
-  const poll: Poll = {
-    id: generateId(),
-    eventName: input.eventName.trim(),
-    timeSlots: input.timeSlots.map((slot) => ({
-      id: generateId(),
+  const { data: poll, error: pollError } = await supabase
+    .from("polls")
+    .select("id, event_name, created_at")
+    .eq("id", id)
+    .maybeSingle();
+
+  if (pollError) throw pollError;
+  if (!poll) return null;
+
+  const { data: timeSlots, error: slotsError } = await supabase
+    .from("time_slots")
+    .select("id, datetime")
+    .eq("poll_id", id)
+    .order("datetime", { ascending: true });
+
+  if (slotsError) throw slotsError;
+
+  const { data: votes, error: votesError } = await supabase
+    .from("votes")
+    .select("voter_name, slot_id, available")
+    .eq("poll_id", id);
+
+  if (votesError) throw votesError;
+
+  return {
+    id: poll.id,
+    eventName: poll.event_name,
+    createdAt: poll.created_at,
+    timeSlots: (timeSlots ?? []).map((slot) => ({
+      id: slot.id,
       datetime: slot.datetime,
     })),
-    votes: [],
-    createdAt: new Date().toISOString(),
+    votes: (votes ?? []).map((vote) => ({
+      voterName: vote.voter_name,
+      slotId: vote.slot_id,
+      available: vote.available,
+    })),
   };
+}
 
-  polls.push(poll);
-  await writePolls(polls);
+export async function createPoll(input: CreatePollInput): Promise<Poll> {
+  const supabase = getSupabaseAdmin();
+  const pollId = generateId();
+  const createdAt = new Date().toISOString();
+
+  const { error: pollError } = await supabase.from("polls").insert({
+    id: pollId,
+    event_name: input.eventName.trim(),
+    created_at: createdAt,
+  });
+
+  if (pollError) throw pollError;
+
+  const timeSlots = input.timeSlots.map((slot) => ({
+    id: generateId(),
+    poll_id: pollId,
+    datetime: slot.datetime,
+  }));
+
+  const { error: slotsError } = await supabase
+    .from("time_slots")
+    .insert(timeSlots);
+
+  if (slotsError) throw slotsError;
+
+  const poll = await fetchPollById(pollId);
+  if (!poll) throw new Error("Failed to load poll after creation");
+
   return poll;
 }
 
 export async function getPoll(id: string): Promise<Poll | null> {
-  const polls = await ensureDataFile();
-  return polls.find((p) => p.id === id) ?? null;
+  return fetchPollById(id);
 }
 
 export async function submitVotes(
   pollId: string,
   input: SubmitVotesInput
 ): Promise<Poll | null> {
-  const polls = await ensureDataFile();
-  const index = polls.findIndex((p) => p.id === pollId);
-  if (index === -1) return null;
+  const supabase = getSupabaseAdmin();
+  const poll = await fetchPollById(pollId);
+  if (!poll) return null;
 
-  const poll = polls[index];
   const voterName = input.voterName.trim();
+  const normalizedName = voterName.toLowerCase();
 
-  // Replace existing votes from this voter
-  const otherVotes = poll.votes.filter(
-    (v) => v.voterName.toLowerCase() !== voterName.toLowerCase()
-  );
+  const { data: existingVotes, error: fetchError } = await supabase
+    .from("votes")
+    .select("id, voter_name")
+    .eq("poll_id", pollId);
 
-  const newVotes: Vote[] = input.votes.map((v) => ({
-    voterName,
-    slotId: v.slotId,
-    available: v.available,
+  if (fetchError) throw fetchError;
+
+  const voteIdsToDelete = (existingVotes ?? [])
+    .filter((vote) => vote.voter_name.toLowerCase() === normalizedName)
+    .map((vote) => vote.id);
+
+  if (voteIdsToDelete.length > 0) {
+    const { error: deleteError } = await supabase
+      .from("votes")
+      .delete()
+      .in("id", voteIdsToDelete);
+
+    if (deleteError) throw deleteError;
+  }
+
+  const newVotes = input.votes.map((vote) => ({
+    poll_id: pollId,
+    slot_id: vote.slotId,
+    voter_name: voterName,
+    available: vote.available,
   }));
 
-  poll.votes = [...otherVotes, ...newVotes];
-  polls[index] = poll;
-  await writePolls(polls);
-  return poll;
+  if (newVotes.length > 0) {
+    const { error: insertError } = await supabase.from("votes").insert(newVotes);
+    if (insertError) throw insertError;
+  }
+
+  return fetchPollById(pollId);
 }
 
 export function computeResults(poll: Poll): PollResults {
